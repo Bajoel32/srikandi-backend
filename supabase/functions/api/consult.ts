@@ -135,9 +135,9 @@ async function runTool(
 
     const customerName = (order.customers as unknown as { name: string } | null)?.name ?? '';
     const loggedInOwner = session && session.id === order.customer_id;
-    const claimed = String(input.customerName ?? '').toLowerCase().trim();
-    const nameOk =
-      claimed.length > 2 && customerName.toLowerCase().split(' ').every((t) => claimed.includes(t));
+    const normalizeName = (s: string) => s.toLowerCase().trim().replace(/\s+/g, ' ');
+    const claimed = normalizeName(String(input.customerName ?? ''));
+    const nameOk = claimed.length > 2 && claimed === normalizeName(customerName);
 
     if (!loggedInOwner && !nameOk) {
       const data = { needVerification: true, orderNumber };
