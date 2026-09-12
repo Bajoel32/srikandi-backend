@@ -1,0 +1,6 @@
+project_id = "srikandi"
+
+[functions.api]
+# Endpoint dipanggil langsung dari browser (GitHub Pages), tanpa anon key.
+# Otorisasi diurus di dalam function: token sesi konsumen & x-sales-key.
+verify_jwt = false

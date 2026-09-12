@@ -1,0 +1,49 @@
+name: Deploy Edge Function
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/functions/**'
+      - 'supabase/config.toml'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Secret yang dibutuhkan (Settings -> Secrets and variables -> Actions):
+#   SUPABASE_ACCESS_TOKEN  -> Account Settings -> Access Tokens di dashboard Supabase
+#   SUPABASE_PROJECT_REF   -> deretan huruf di URL dashboard project
+#
+# Migrasi database SENGAJA tidak ikut otomatis. Perubahan skema dijalankan
+# manual lewat SQL Editor / `supabase db push` supaya sempat di-review dulu.
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy function `api`
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          supabase functions deploy api \
+            --project-ref "${{ secrets.SUPABASE_PROJECT_REF }}" \
+            --no-verify-jwt
+
+      - name: Cek endpoint /health
+        run: |
+          URL="https://${{ secrets.SUPABASE_PROJECT_REF }}.supabase.co/functions/v1/api/health"
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -s -o /tmp/health.json -w '%{http_code}' "$URL" || true)
+            if [ "$CODE" = "200" ]; then
+              echo "OK:"; cat /tmp/health.json; exit 0
+            fi
+            echo "percobaan $i: HTTP $CODE — tunggu 5 detik"
+            sleep 5
+          done
+          echo "Function ter-deploy tapi /health belum menjawab 200."
+          exit 1
