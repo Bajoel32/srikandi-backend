@@ -1,10 +1,23 @@
 // Asisten konsultasi: RAG ringan (galeri + layanan dari database) + tool use.
+//
+// Backend LLM: Gemini API (generativelanguage.googleapis.com), endpoint
+// `:generateContent`. Bentuk tool-nya beda dari Anthropic — `functionDeclarations`
+// untuk deklarasi, `functionCall` di balasan model, `functionResponse` untuk
+// mengirim hasil tool kembali.
 import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.58.0';
 import { toGalleryItem } from './_shared.ts';
 
-const API_KEY = Deno.env.get('ANTHROPIC_API_KEY') ?? '';
-const MODEL = Deno.env.get('CONSULT_MODEL') ?? 'claude-sonnet-4-5';
+const API_KEY = Deno.env.get('GEMINI_API_KEY') ?? '';
+const MODEL = Deno.env.get('CONSULT_MODEL') ?? 'gemini-3.5-flash';
 const WHATSAPP = Deno.env.get('WHATSAPP_URL') ?? 'https://wa.me/6281234567890';
+
+const endpoint = (model: string) =>
+  `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+// Model Gemini berpikir dulu sebelum menjawab, dan token "thinking" itu ikut
+// dihitung ke maxOutputTokens. Jadi plafonnya dilonggarkan; panjang jawaban
+// tetap dijaga lewat instruksi "maksimal 4 kalimat" di SYSTEM.
+const MAX_OUTPUT_TOKENS = 2048;
 
 export const hasLLM = () => Boolean(API_KEY);
 
@@ -41,51 +54,59 @@ Aturan:
 
 Alamat toko: Jl. Sumatra, Pahandut, Kota Palangka Raya. Buka Senin–Sabtu 09.00–16.00, Minggu 10.00–16.00.`;
 
+// Gemini: satu entri `tools` berisi daftar `functionDeclarations`.
+// Fungsi tanpa argumen sengaja tidak menyertakan `parameters` sama sekali —
+// schema object dengan properties kosong ditolak sebagian versi API.
 const TOOLS = [
   {
-    name: 'infoLayanan',
-    description: 'Daftar layanan yang tersedia di Srikandi beserta deskripsinya.',
-    input_schema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'rekomendasiGaleri',
-    description:
-      'Cari perhiasan di galeri toko. Pakai saat pengguna minta rekomendasi, menanyakan koleksi, kategori, atau rentang harga.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Kata kunci bebas, mis. "cincin berlian"' },
-        category: { type: 'string', description: 'Cincin | Kalung | Gelang | Anting | Liontin' },
-        maxPrice: { type: 'number', description: 'Batas harga maksimum dalam rupiah' },
+    functionDeclarations: [
+      {
+        name: 'infoLayanan',
+        description: 'Daftar layanan yang tersedia di Srikandi beserta deskripsinya.',
       },
-    },
-  },
-  {
-    name: 'cekStatusPesanan',
-    description:
-      'Cek progres pesanan berdasarkan nomor pesanan (format SR-001-2026). Jika pengguna belum login, nama pemesan wajib disebutkan untuk verifikasi.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        orderNumber: { type: 'string' },
-        customerName: { type: 'string', description: 'Nama pemesan, untuk verifikasi bila belum login' },
+      {
+        name: 'rekomendasiGaleri',
+        description:
+          'Cari perhiasan di galeri toko. Pakai saat pengguna minta rekomendasi, menanyakan koleksi, kategori, atau rentang harga.',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Kata kunci bebas, mis. "cincin berlian"' },
+            category: { type: 'string', description: 'Cincin | Kalung | Gelang | Anting | Liontin' },
+            maxPrice: { type: 'number', description: 'Batas harga maksimum dalam rupiah' },
+          },
+        },
       },
-      required: ['orderNumber'],
-    },
-  },
-  {
-    name: 'hubungiAdmin',
-    description: 'Panggil bila pengguna butuh admin/manusia: komplain, refund, ubah atau batalkan pesanan, di luar cakupan.',
-    input_schema: {
-      type: 'object',
-      properties: { alasan: { type: 'string' } },
-      required: ['alasan'],
-    },
+      {
+        name: 'cekStatusPesanan',
+        description:
+          'Cek progres pesanan berdasarkan nomor pesanan (format SR-001-2026). Jika pengguna belum login, nama pemesan wajib disebutkan untuk verifikasi.',
+        parameters: {
+          type: 'object',
+          properties: {
+            orderNumber: { type: 'string' },
+            customerName: { type: 'string', description: 'Nama pemesan, untuk verifikasi bila belum login' },
+          },
+          required: ['orderNumber'],
+        },
+      },
+      {
+        name: 'hubungiAdmin',
+        description: 'Panggil bila pengguna butuh admin/manusia: komplain, refund, ubah atau batalkan pesanan, di luar cakupan.',
+        parameters: {
+          type: 'object',
+          properties: { alasan: { type: 'string' } },
+          required: ['alasan'],
+        },
+      },
+    ],
   },
 ];
 
 type Session = { id: number; name: string; phone: string } | null;
 type FnCard = { name: string; label: string; data: unknown };
+// deno-lint-ignore no-explicit-any
+type Part = Record<string, any>;
 
 async function runTool(
   db: SupabaseClient,
@@ -186,55 +207,73 @@ export async function consult(
     };
   }
 
-  // deno-lint-ignore no-explicit-any
-  const messages: any[] = history.map((m) => ({ role: m.role, content: m.content }));
+  // Gemini memakai role 'model' untuk balasan asisten, dan giliran pertama
+  // wajib dari 'user' — pesan asisten yang menggantung di depan dibuang.
+  const contents: Array<{ role: 'user' | 'model'; parts: Part[] }> = [];
+  for (const m of history) {
+    const role = m.role === 'assistant' ? 'model' : 'user';
+    if (contents.length === 0 && role === 'model') continue;
+    contents.push({ role, parts: [{ text: m.content }] });
+  }
+  if (contents.length === 0) {
+    return { reply: 'Maaf, saya belum bisa menjawab itu. Boleh dijelaskan lebih spesifik?' };
+  }
+
   const cards: FnCard[] = [];
   const sources: Array<{ title: string; snippet?: string }> = [];
   let escalate: ReturnType<typeof buildEscalation> | undefined;
   let reply = '';
 
   for (let round = 0; round < 3; round++) {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch(endpoint(MODEL), {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-api-key': API_KEY,
-        'anthropic-version': '2023-06-01',
+        'x-goog-api-key': API_KEY,
       },
       body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 700,
-        system: session ? `${SYSTEM}\n\nPengguna sudah login sebagai ${session.name}.` : SYSTEM,
+        contents,
+        systemInstruction: {
+          parts: [{ text: session ? `${SYSTEM}\n\nPengguna sudah login sebagai ${session.name}.` : SYSTEM }],
+        },
         tools: TOOLS,
-        messages,
+        generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS, temperature: 0.4 },
       }),
     });
 
     if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
     const data = await res.json();
 
-    reply = (data.content ?? [])
-      .filter((b: { type: string }) => b.type === 'text')
-      .map((b: { text: string }) => b.text)
+    const candidate = data.candidates?.[0];
+    const parts: Part[] = candidate?.content?.parts ?? [];
+
+    const text = parts
+      .filter((p) => typeof p.text === 'string')
+      .map((p) => p.text as string)
       .join('\n')
       .trim();
+    if (text) reply = text;
 
-    const toolUses = (data.content ?? []).filter((b: { type: string }) => b.type === 'tool_use');
-    if (data.stop_reason !== 'tool_use' || toolUses.length === 0) break;
+    const calls = parts
+      .filter((p) => p.functionCall)
+      .map((p) => p.functionCall as { name: string; args?: Record<string, unknown> });
+    if (calls.length === 0) break;
 
-    messages.push({ role: 'assistant', content: data.content });
+    // Giliran model (berisi functionCall) harus ikut dikirim balik apa adanya.
+    contents.push({ role: 'model', parts });
 
-    const results = [];
-    for (const tu of toolUses) {
-      const { result, card, source } = await runTool(db, session, tu.name, tu.input ?? {});
+    const responses: Part[] = [];
+    for (const call of calls) {
+      const { result, card, source } = await runTool(db, session, call.name, call.args ?? {});
       if (card) cards.push(card);
       if (source) sources.push(source);
-      if (tu.name === 'hubungiAdmin') {
-        escalate = buildEscalation(String(tu.input?.alasan ?? 'Perlu tindakan admin'), lastUser.slice(0, 200));
+      if (call.name === 'hubungiAdmin') {
+        escalate = buildEscalation(String(call.args?.alasan ?? 'Perlu tindakan admin'), lastUser.slice(0, 200));
       }
-      results.push({ type: 'tool_result', tool_use_id: tu.id, content: JSON.stringify(result) });
+      // functionResponse.response wajib berupa objek, jadi hasil dibungkus.
+      responses.push({ functionResponse: { name: call.name, response: { result } } });
     }
-    messages.push({ role: 'user', content: results });
+    contents.push({ role: 'user', parts: responses });
   }
 
   return {
