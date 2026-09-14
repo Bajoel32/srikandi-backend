@@ -187,7 +187,7 @@ Deno.serve(async (req) => {
 
     /* -------------------------------------------------------- konsultasi -- */
     if (path === '/consult' && req.method === 'POST') {
-      if (!hasLLM()) return fail(req, 503, 'Asisten AI belum aktif (ANTHROPIC_API_KEY belum diset).');
+      if (!hasLLM()) return fail(req, 503, 'Asisten AI belum aktif (GEMINI_API_KEY belum diset).');
       if (!(await rateLimit(db, clientKey(req, 'consult'), 30, 3600)))
         return fail(req, 429, 'Kuota tanya-jawab tercapai. Coba lagi satu jam lagi.');
 
