@@ -86,7 +86,7 @@ supabase secrets set --env-file .env --project-ref <project-ref>
 | Secret              | Wajib              | Isi                                                    |
 | ------------------- | ------------------ | ------------------------------------------------------ |
 | `SALES_KEY_SHA256`  | untuk upload sales | hash-dari-hash kata sandi sales, lihat di bawah         |
-| `ANTHROPIC_API_KEY` | untuk asisten AI   | API key dari aistudio.google.com/apikey                      |
+| `GEMINI_API_KEY` | untuk asisten AI   | API key dari aistudio.google.com/apikey                      |
 | `CONSULT_MODEL`     | tidak              | default `gemini-3.5-flash`                             |
 | `ALLOWED_ORIGINS`   | tidak              | default sudah mencakup GitHub Pages + localhost         |
 | `WHATSAPP_URL`      | tidak              | link WhatsApp admin untuk tombol eskalasi               |
