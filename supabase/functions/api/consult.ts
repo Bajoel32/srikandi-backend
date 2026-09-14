@@ -49,6 +49,8 @@ Aturan:
 - Jawab HANYA dari data yang kamu peroleh lewat tool atau yang tertulis di sini. Jangan mengarang harga, estimasi waktu, kadar, atau ketersediaan.
 - Harga & lama pengerjaan layanan bersifat penawaran; selalu katakan dikonfirmasi staf setelah barang dilihat langsung.
 - Untuk status pesanan, WAJIB pakai tool cekStatusPesanan. Jangan menebak.
+- Kalau pengguna belum login, minta nama pemesan DULU sebelum memanggil cekStatusPesanan.
+- Jangan pernah menyatakan sebuah nomor pesanan "ada" atau "tidak ditemukan". Bila verifikasi gagal, katakan nomor pesanan atau nama pemesan tidak cocok, lalu tawarkan bantuan lewat WhatsApp.
 - Jangan pernah meminta atau menampilkan data pribadi (NIK, nomor kartu, alamat lengkap) di chat.
 - Kalau pertanyaannya di luar cakupan toko, komplain, atau butuh tindakan admin (ubah/batalkan pesanan, refund), panggil tool hubungiAdmin.
 
@@ -80,7 +82,7 @@ const TOOLS = [
       {
         name: 'cekStatusPesanan',
         description:
-          'Cek progres pesanan berdasarkan nomor pesanan (format SR-001-2026). Jika pengguna belum login, nama pemesan wajib disebutkan untuk verifikasi.',
+          'Cek progres pesanan berdasarkan nomor pesanan (format SR-001-2026). Jika pengguna belum login, nama pemesan WAJIB disertakan — jangan panggil tool ini tanpa nama. Tool ini tidak pernah memberi tahu apakah sebuah nomor pesanan terdaftar atau tidak.',
         parameters: {
           type: 'object',
           properties: {
@@ -141,32 +143,34 @@ async function runTool(
 
   if (name === 'cekStatusPesanan') {
     const orderNumber = String(input.orderNumber ?? '').toUpperCase().trim();
+
+    // Satu balasan penolakan untuk SEMUA kegagalan: nomor tidak terdaftar,
+    // format ngawur, nama tidak cocok, atau pesanan milik orang lain. Kalau
+    // "tidak ditemukan" dibedakan dari "perlu verifikasi", nomor pesanan bisa
+    // disisir SR-001 s/d SR-999 untuk memetakan isi tabel orders.
+    const denied = () => {
+      const data = session
+        ? { notYours: true, orderNumber }
+        : { needVerification: true, orderNumber };
+      return { result: data, card: { name: 'cekStatusPesanan', label: 'Status Pesanan', data } };
+    };
+
+    // Format divalidasi lebih dulu supaya tebakan asal tidak menyentuh database.
+    if (!/^SR-\d{3}-\d{4}$/.test(orderNumber)) return denied();
+
     const { data: order } = await db
       .from('orders')
       .select('order_number, service_name, status, progress, gold_purity, customer_id, customers ( name )')
       .eq('order_number', orderNumber)
       .maybeSingle();
 
-    if (!order) {
-      return {
-        result: { notFound: true, orderNumber },
-        card: { name: 'cekStatusPesanan', label: 'Status Pesanan', data: { notFound: true, orderNumber } },
-      };
-    }
-
-    const customerName = (order.customers as unknown as { name: string } | null)?.name ?? '';
-    const loggedInOwner = session && session.id === order.customer_id;
+    const customerName = (order?.customers as unknown as { name: string } | null)?.name ?? '';
+    const loggedInOwner = Boolean(order && session && session.id === order.customer_id);
     const normalizeName = (s: string) => s.toLowerCase().trim().replace(/\s+/g, ' ');
     const claimed = normalizeName(String(input.customerName ?? ''));
-    const nameOk = claimed.length > 2 && claimed === normalizeName(customerName);
+    const nameOk = Boolean(order) && claimed.length > 2 && claimed === normalizeName(customerName);
 
-    if (!loggedInOwner && !nameOk) {
-      const data = { needVerification: true, orderNumber };
-      return {
-        result: data,
-        card: { name: 'cekStatusPesanan', label: 'Status Pesanan', data },
-      };
-    }
+    if (!order || (!loggedInOwner && !nameOk)) return denied();
 
     const data = {
       orderNumber: order.order_number,
