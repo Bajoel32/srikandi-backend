@@ -49,6 +49,9 @@ Aturan:
 - Jawab HANYA dari data yang kamu peroleh lewat tool atau yang tertulis di sini. Jangan mengarang harga, estimasi waktu, kadar, atau ketersediaan.
 - Harga & lama pengerjaan layanan bersifat penawaran; selalu katakan dikonfirmasi staf setelah barang dilihat langsung.
 - Untuk status pesanan, WAJIB pakai tool cekStatusPesanan. Jangan menebak.
+- Status pesanan hanya untuk pengguna yang sudah masuk. Kalau belum masuk, minta pengguna masuk lewat portal pesanan di situs, atau tawarkan bantuan lewat WhatsApp.
+- JANGAN PERNAH meminta nomor HP, kode akses, atau kata sandi di chat ini. Proses masuk hanya lewat halaman portal pesanan.
+- Jangan pernah menyatakan sebuah nomor pesanan "ada" atau "tidak ditemukan". Bila pesanan bukan milik pengguna yang sedang masuk, cukup katakan nomor itu tidak ada pada akunnya.
 - Jangan pernah meminta atau menampilkan data pribadi (NIK, nomor kartu, alamat lengkap) di chat.
 - Kalau pertanyaannya di luar cakupan toko, komplain, atau butuh tindakan admin (ubah/batalkan pesanan, refund), panggil tool hubungiAdmin.
 
@@ -80,12 +83,11 @@ const TOOLS = [
       {
         name: 'cekStatusPesanan',
         description:
-          'Cek progres pesanan berdasarkan nomor pesanan (format SR-001-2026). Jika pengguna belum login, nama pemesan wajib disebutkan untuk verifikasi.',
+          'Cek progres pesanan milik pengguna yang sedang masuk, berdasarkan nomor pesanan (format SR-001-2026). Hanya melayani pengguna yang sudah masuk; tidak ada cara memverifikasi lewat chat. Tool ini tidak pernah memberi tahu apakah sebuah nomor pesanan terdaftar atau tidak.',
         parameters: {
           type: 'object',
           properties: {
             orderNumber: { type: 'string' },
-            customerName: { type: 'string', description: 'Nama pemesan, untuk verifikasi bila belum login' },
           },
           required: ['orderNumber'],
         },
@@ -141,36 +143,42 @@ async function runTool(
 
   if (name === 'cekStatusPesanan') {
     const orderNumber = String(input.orderNumber ?? '').toUpperCase().trim();
+
+    // Status pesanan hanya untuk sesi yang sudah masuk. Verifikasi lewat chat
+    // (nama, apalagi nomor HP) tidak dipakai: nomor HP justru diblokir filter
+    // PII di index.ts sebelum sampai ke sini, dan nama pemesan terlalu mudah
+    // ditebak untuk dijadikan kunci.
+    if (!session) {
+      const data = { needLogin: true };
+      return { result: data, card: { name: 'cekStatusPesanan', label: 'Status Pesanan', data } };
+    }
+
+    // Satu balasan penolakan untuk SEMUA kegagalan: nomor tidak terdaftar,
+    // format ngawur, atau pesanan milik akun lain. Kalau "tidak ditemukan"
+    // dibedakan dari "bukan milikmu", nomor pesanan bisa disisir SR-001 s/d
+    // SR-999 untuk memetakan isi tabel orders.
+    const denied = () => {
+      const data = { notYours: true, orderNumber };
+      return { result: data, card: { name: 'cekStatusPesanan', label: 'Status Pesanan', data } };
+    };
+
+    // Format divalidasi lebih dulu supaya tebakan asal tidak menyentuh database.
+    if (!/^SR-\d{3}-\d{4}$/.test(orderNumber)) return denied();
+
+    // Difilter langsung ke customer_id sesi: pesanan milik orang lain tidak
+    // pernah terbaca, bukan sekadar tidak ditampilkan.
     const { data: order } = await db
       .from('orders')
-      .select('order_number, service_name, status, progress, gold_purity, customer_id, customers ( name )')
+      .select('order_number, service_name, status, progress, gold_purity, customer_id')
       .eq('order_number', orderNumber)
+      .eq('customer_id', session.id)
       .maybeSingle();
 
-    if (!order) {
-      return {
-        result: { notFound: true, orderNumber },
-        card: { name: 'cekStatusPesanan', label: 'Status Pesanan', data: { notFound: true, orderNumber } },
-      };
-    }
-
-    const customerName = (order.customers as unknown as { name: string } | null)?.name ?? '';
-    const loggedInOwner = session && session.id === order.customer_id;
-    const normalizeName = (s: string) => s.toLowerCase().trim().replace(/\s+/g, ' ');
-    const claimed = normalizeName(String(input.customerName ?? ''));
-    const nameOk = claimed.length > 2 && claimed === normalizeName(customerName);
-
-    if (!loggedInOwner && !nameOk) {
-      const data = { needVerification: true, orderNumber };
-      return {
-        result: data,
-        card: { name: 'cekStatusPesanan', label: 'Status Pesanan', data },
-      };
-    }
+    if (!order) return denied();
 
     const data = {
       orderNumber: order.order_number,
-      customerName,
+      customerName: session.name,
       serviceName: order.service_name,
       status: order.status,
       progress: order.progress,
