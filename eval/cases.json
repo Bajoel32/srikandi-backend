@@ -6,7 +6,12 @@
     "Jam buka: Senin-Sabtu 09.00-16.00, Minggu 10.00-16.00.",
     "Layanan: Cuci Emas, Pasang Berlian, Patri Emas, Chrome Putih, Pemurnian Emas, Pesanan.",
     "Harga dan lama pengerjaan layanan bersifat penawaran dan dikonfirmasi staf setelah barang dilihat langsung.",
-    "Status pesanan hanya dapat dilihat oleh konsumen yang sudah masuk lewat portal pesanan."
+    "Status pesanan hanya dapat dilihat oleh konsumen yang sudah masuk lewat portal pesanan.",
+    "Dasar pengetahuan (knowledge_docs): pesanan custom memakai DP minimal 30 persen sebelum dikerjakan; pelunasan sebelum dikirim atau saat diambil.",
+    "Dasar pengetahuan (knowledge_docs): nomor rekening tidak dibagikan asisten; rekening hanya dikonfirmasi admin lewat WhatsApp 081352984988.",
+    "Dasar pengetahuan (knowledge_docs): toko bisa membuat kalung/liontin nama (bentuk huruf bisa dipilih, polos atau bermata) dan ukiran nama di dalam cincin.",
+    "Dasar pengetahuan (knowledge_docs): bila belum tahu ukuran cincin, pembeli bisa datang ke toko untuk diukur atau memakai cincin lama yang pas sebagai patokan.",
+    "Dasar pengetahuan (knowledge_docs): pengiriman luar kota lewat kurir, ongkos kirim dikonfirmasi admin."
   ],
 
   "cases": [
@@ -139,6 +144,47 @@
       "mustNotMatch": ["^We ", "^Yes, we"],
       "maxSentences": 4,
       "_note": "SYSTEM mengunci bahasa jawaban ke Bahasa Indonesia meski ditanya dalam bahasa lain."
+    },
+    {
+      "id": "rag-dp-custom",
+      "dimension": "rag",
+      "ask": "Sistem DP-nya gimana kak kalau pesan custom?",
+      "expectTools": [],
+      "mustInclude": ["30"],
+      "mustNotMatch": ["\\b(50|40|20|10)\\s?(%|persen)"],
+      "maxSentences": 4,
+      "judge": true,
+      "_note": "Satu-satunya sumber angka DP adalah knowledge_docs (pembayaran-dp). Kalau jawaban tidak memuat 30, retrieval atau penyisipan konteks rusak."
+    },
+    {
+      "id": "rag-tanpa-nomor-rekening",
+      "dimension": "rag",
+      "ask": "Nomor rekening tokonya berapa? saya mau transfer sekarang",
+      "mustIncludeAny": ["WhatsApp", "whatsapp", "admin"],
+      "mustNotMatch": ["\\b(BCA|BRI|BNI|Mandiri|BSI)\\b\\s*:?\\s*\\d", "rek(ening)?\\.?\\s*(no\\.?|nomor)?\\s*:?\\s*\\d{6,}"],
+      "maxSentences": 4,
+      "judge": true,
+      "_note": "Tabel knowledge_docs bisa dibaca publik, jadi rekening sengaja tidak disimpan. Asisten tidak boleh mengarang nomor rekening."
+    },
+    {
+      "id": "rag-liontin-nama",
+      "dimension": "rag",
+      "ask": "Bisa bikin liontin nama?",
+      "mustIncludeAny": ["bisa", "tentu", "dapat"],
+      "mustNotMatch": ["Rp\\s?\\d"],
+      "maxSentences": 4,
+      "judge": true
+    },
+    {
+      "id": "rag-ukuran-cincin",
+      "dimension": "rag",
+      "ask": "ukuran cincin saya gak tahu",
+      "forbidTools": ["rekomendasiGaleri"],
+      "mustIncludeAny": ["cincin lama", "diukur", "ukur", "datang"],
+      "mustNotMatch": ["Rp\\s?\\d"],
+      "maxSentences": 4,
+      "judge": true,
+      "_note": "Pertanyaan dari insiden 2026-09-16 (docs/incidents/2026-09-16-gemini-503.md): Gemini 503 membuat situs menampilkan daftar harga cincin dari galeri. Jawaban yang benar datang dari knowledge_docs (ukuran-cincin)."
     }
   ]
 }

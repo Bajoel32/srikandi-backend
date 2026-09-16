@@ -4,17 +4,34 @@ Jaring pengaman regresi untuk `POST /consult`. Menjawab satu pertanyaan yang
 tidak bisa dijawab oleh unit test biasa: **apakah asistennya masih berperilaku
 benar setelah prompt, model, atau tool-nya diubah?**
 
-Ditulis untuk Node 18+ tanpa satu pun dependency.
+Tanpa satu pun dependency. Ada dua harness yang saling melengkapi:
+
+| | `run.mjs` (live) | `offline.mjs` |
+| --- | --- | --- |
+| Yang diuji | Perilaku **model** di produksi | Perilaku **kode** di sekitar model |
+| Gemini & Supabase | Sungguhan | Tiruan, deterministik |
+| Biaya | 1 panggilan Gemini + 1 baris `consult_logs` per kasus | Gratis, ±10 detik |
+| Bisa menyuntikkan kegagalan (503, 429, jaringan putus) | Tidak | Ya |
+| Node | 18+ | 22.6+ (memuat `.ts` langsung) |
 
 ```bash
+# live — 20 kasus, beberapa menit
 export SRIKANDI_API="https://<project-ref>.supabase.co/functions/v1/api"
-
-node eval/run.mjs                 # cek berbasis aturan (16 kasus, ~1 menit)
+node eval/run.mjs                 # cek berbasis aturan
 node eval/run.mjs --judge         # + skor groundedness lewat LLM
-node eval/run.mjs --only=auth-    # jalankan sebagian
+node eval/run.mjs --only=rag-     # jalankan sebagian
+
+# offline — 15 kasus
+node --experimental-strip-types eval/offline.mjs
+node --experimental-strip-types eval/offline.mjs --only=res-
+
+# buktikan kasus offline menangkap bug: jalankan terhadap versi lama
+git show <commit-lama>:supabase/functions/api/consult.ts > /tmp/consult.lama.ts
+node --experimental-strip-types eval/offline.mjs --target=/tmp/consult.lama.ts --out=offline-report.lama.json
 ```
 
-Keluar dengan kode `1` bila ada kasus gagal, jadi bisa langsung dipakai di CI.
+Keduanya keluar dengan kode `1` bila ada kasus gagal, jadi bisa langsung dipakai di CI.
+Hasil terakhir dan perbandingan sebelum/sesudah perbaikan ada di [`RESULTS.md`](RESULTS.md).
 
 ## Yang diukur
 
@@ -25,12 +42,24 @@ Keluar dengan kode `1` bila ada kasus gagal, jadi bisa langsung dipakai di CI.
 | `auth` | Status pesanan tidak bocor tanpa sesi, dan nomor pesanan tidak bisa disisir. |
 | `guardrail` | Eskalasi komplain, blokir PII, dan penolakan membocorkan system prompt. |
 | `format` | Panjang jawaban dan bahasa. |
+| `rag` | Fakta dari `knowledge_docs` (DP 30 %, rekening lewat admin, liontin nama, ukuran cincin) benar-benar sampai ke jawaban. |
+
+Dimensi tambahan di `offline.mjs`:
+
+| Dimensi | Menangkap |
+| --- | --- |
+| `resilience` | 503/429/5xx/jaringan putus → coba ulang, model cadangan, lalu pesan "asisten sibuk" + WhatsApp — bukan HTTP 500. |
+| `rag` | Dokumen hasil `match_knowledge_docs` masuk ke system prompt; parameter embedding benar; embedding gagal tidak menjatuhkan jawaban. |
+| `guardrail` | Eskalasi cepat tidak memanggil LLM maupun embedding; aturan rekening ada di prompt. |
+| `tool-loop` | `functionCall` → `functionResponse` → jawaban; kartu tool terbentuk. |
 
 Dua lapis pemeriksaan:
 
 **Berbasis aturan** — deterministik, gratis, tidak memanggil LLM tambahan.
 Memeriksa tool yang dipanggil, isi `data` kartu tool, ada/tidaknya `escalate`,
-substring dan pola regex yang wajib/haram muncul, serta jumlah kalimat.
+substring dan pola regex yang wajib/haram muncul, serta jumlah kalimat. Cek
+`llm-menjawab` menggagalkan kasus bila balasannya pesan "asisten sibuk" — tanpa
+itu, kasus berbasis `mustNotMatch` bisa lulus padahal model tidak pernah menjawab.
 
 **LLM judge** (`--judge`, butuh `GEMINI_API_KEY`) — menilai groundedness:
 apakah jawaban hanya memuat klaim yang didukung hasil tool atau daftar fakta
@@ -48,6 +77,12 @@ bisa dibedakan**. Sebelum diperbaiki, yang satu dijawab `notFound` dan yang lain
 `SR-999` dan memetakan berapa banyak pesanan yang ada di toko, tanpa perlu tahu
 nama siapa pun. Kalau suatu hari kedua kasus ini gagal bersamaan, oracle itu
 terbuka lagi.
+
+`rag-ukuran-cincin` (live) dan `res-503-pulih` / `res-503-habis` (offline)
+berasal dari [insiden 2026-09-16](../docs/incidents/2026-09-16-gemini-503.md):
+Gemini 503 membuat situs menampilkan daftar harga cincin untuk pertanyaan
+"ukuran cincin saya gak tahu". Versi `consult.ts` sebelum perbaikan lulus
+9/15 kasus offline; sesudahnya 15/15.
 
 ## Menambah kasus
 
@@ -70,7 +105,8 @@ Setiap kali ada bug perilaku yang diperbaiki, tambahkan satu entri di
 ## Catatan yang perlu dibaca sebelum menjalankan
 
 **Ini memanggil produksi.** Setiap kasus berarti satu panggilan Gemini
-sungguhan dan satu baris di `consult_logs`. Belum ada mode offline.
+sungguhan dan satu baris di `consult_logs`. Untuk menguji kode tanpa
+menyentuh produksi, pakai `offline.mjs`.
 
 **Kuota free tier tipis.** Tiga permintaan beruntun sudah cukup memicu
 `429 You exceeded your current quota`. Karena itu ada jeda 4 detik antar-kasus
@@ -78,9 +114,22 @@ sungguhan dan satu baris di `consult_logs`. Belum ada mode offline.
 `--judge` memakai sekitar 21 panggilan; jalankan saat kuota harian masih kosong,
 atau pakai `--only=` untuk menguji sebagian.
 
+**Rate limit backend: 30 konsultasi per jam per IP.** Semua percobaan ulang
+ikut dihitung, termasuk uji manual dari jaringan yang sama. Begitu `/consult`
+membalas `429 Kuota tanya-jawab tercapai`, `run.mjs` berhenti dan menandai sisa
+kasus sebagai *tidak terukur* — mengulang hanya menghabiskan jatah dan membuat
+chatbot di situs ikut menolak pengunjung dari IP itu selama satu jam. Dengan
+20 kasus, sisakan ruang: `--retries=1`, atau pecah per awalan dengan `--only=`.
+
 **Temperature 0.4, jadi hasilnya tidak sepenuhnya deterministik.** Satu kasus
 yang gagal sekali belum tentu regresi — ulangi dengan `--only=<id>` sebelum
 menyimpulkan. Yang perlu ditindak adalah kegagalan yang konsisten.
 
-`eval/report.json` adalah keluaran, bukan sumber kebenaran — file itu
-di-`.gitignore` supaya tidak ada laporan basi yang ikut ter-commit.
+**Balasan "asisten sibuk" juga diulang.** Sejak `consult.ts` membalas Gemini
+yang sibuk dengan HTTP 200 + pesan "asisten sibuk", `run.mjs` memperlakukan
+balasan itu seperti 429/500: diulang dengan backoff, dan bila tetap sibuk,
+kasusnya gagal di cek `llm-menjawab`.
+
+`eval/report.json` dan `eval/offline-report*.json` adalah keluaran, bukan sumber
+kebenaran — keduanya di-`.gitignore` supaya tidak ada laporan basi yang ikut
+ter-commit. Ringkasan yang sengaja disimpan ada di `RESULTS.md`.
