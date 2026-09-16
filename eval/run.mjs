@@ -61,13 +61,29 @@ async function ask(question) {
 
     // 503 = ANTHROPIC/GEMINI key belum diset; 500 sering berarti 429 dari Gemini
     // yang tertelan error handler. Keduanya layak dicoba ulang sekali dua kali.
-    const retryable = res.status === 429 || res.status === 500 || res.status === 503;
+    // Sejak retry di consult.ts, Gemini yang sibuk dijawab 200 + BUSY_REPLY —
+    // itu juga kegagalan infrastruktur, bukan perilaku model, jadi ikut diulang.
+    // 429 dari rate limit backend sendiri (30 konsultasi/jam per IP) TIDAK boleh
+    // diulang: setiap percobaan ikut memakan jatah, dan sisa kasus akan ikut
+    // gagal. Ini beda dengan 429 kuota Gemini yang sudah diulang di consult.ts.
+    if (isBackendRateLimit(res.status, body)) return { status: res.status, body, rateLimited: true };
+    const retryable = res.status === 429 || res.status === 500 || res.status === 503 || isBusyReply(body);
     if (!retryable || attempt === RETRIES) return { status: res.status, body };
 
     const backoff = DELAY_MS * (attempt + 2);
     process.stdout.write(`  (HTTP ${res.status}, tunggu ${backoff}ms lalu ulangi) `);
     await sleep(backoff);
   }
+}
+
+/** Balasan cadangan consult.ts saat semua percobaan ke Gemini gagal. */
+function isBusyReply(body) {
+  return /asisten kami sedang sibuk/i.test(String(body?.reply ?? ''));
+}
+
+/** 429 dari rateLimit() di index.ts, bukan dari Gemini. */
+function isBackendRateLimit(status, body) {
+  return status === 429 && /kuota tanya-jawab/i.test(String(body?.error ?? ''));
 }
 
 const sentences = (s) =>
@@ -90,6 +106,9 @@ function ruleChecks(c, status, body) {
   if (status !== 200) return out;
 
   add('reply-tidak-kosong', reply.trim().length > 0, `${reply.length} char`);
+  // Tanpa cek ini, pesan "asisten sibuk" bisa lolos kasus berbasis mustNotMatch
+  // padahal model tidak pernah menjawab.
+  add('llm-menjawab', !isBusyReply(body), isBusyReply(body) ? 'BUSY_REPLY — Gemini tidak tersedia' : '');
 
   if (Array.isArray(c.expectTools)) {
     const got = toolNames(body);
@@ -188,9 +207,20 @@ console.log(`\nSrikandi eval — ${cases.length} kasus → ${API}`);
 console.log(`judge: ${USE_JUDGE ? JUDGE_MODEL : 'mati'} · jeda ${DELAY_MS}ms\n`);
 
 const results = [];
+let rateLimitedAt = null;
 for (const [i, c] of cases.entries()) {
+  if (rateLimitedAt) {
+    results.push({ id: c.id, dimension: c.dimension, ask: c.ask, status: null, pass: false, skipped: true, checks: [], reply: '' });
+    continue;
+  }
   process.stdout.write(`[${i + 1}/${cases.length}] ${c.id} … `);
-  const { status, body } = await ask(c.ask);
+  const { status, body, rateLimited } = await ask(c.ask);
+  if (rateLimited) {
+    rateLimitedAt = c.id;
+    console.log('BERHENTI — rate limit backend tercapai');
+    results.push({ id: c.id, dimension: c.dimension, ask: c.ask, status, pass: false, skipped: true, checks: [], reply: '' });
+    continue;
+  }
   const checks = ruleChecks(c, status, body);
 
   if (USE_JUDGE && c.judge && status === 200) {
@@ -218,13 +248,19 @@ for (const r of results) {
 }
 
 const passed = results.filter((r) => r.pass).length;
+const nSkipped = results.filter((r) => r.skipped).length;
 console.log(`\n${'='.repeat(52)}`);
-console.log(`Total: ${passed}/${results.length} lulus\n`);
+console.log(`Total: ${passed}/${results.length} lulus${nSkipped ? ` · ${nSkipped} tidak terukur` : ''}\n`);
 for (const [dim, v] of Object.entries(byDim)) {
   console.log(`  ${dim.padEnd(12)} ${String(v.pass).padStart(2)}/${v.total}`);
 }
-const failed = results.filter((r) => !r.pass);
+const failed = results.filter((r) => !r.pass && !r.skipped);
+const skipped = results.filter((r) => r.skipped);
 if (failed.length) console.log(`\nGagal: ${failed.map((r) => r.id).join(', ')}`);
+if (skipped.length) {
+  console.log(`\nTidak terukur (rate limit backend sejak ${rateLimitedAt}): ${skipped.map((r) => r.id).join(', ')}`);
+  console.log(`Ulangi setelah satu jam dengan --only=<awalan id>, atau pakai --retries=0 agar hemat jatah.`);
+}
 
 const outPath = join(HERE, String(args.out ?? 'report.json'));
 await writeFile(outPath, JSON.stringify(
@@ -233,4 +269,4 @@ await writeFile(outPath, JSON.stringify(
 ));
 console.log(`\nLaporan lengkap: ${outPath}\n`);
 
-process.exit(failed.length ? 1 : 0);
+process.exit(failed.length || skipped.length ? 1 : 0);

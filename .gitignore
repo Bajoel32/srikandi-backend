@@ -17,3 +17,4 @@ Thumbs.db
 
 # Keluaran eval — dihasilkan ulang tiap run, jangan di-commit
 eval/report.json
+eval/offline-report*.json
