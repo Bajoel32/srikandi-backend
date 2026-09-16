@@ -1,4 +1,4 @@
-// Asisten konsultasi: RAG ringan (galeri + layanan dari database) + tool use.
+// Asisten konsultasi: RAG (dasar pengetahuan di knowledge_docs + galeri + layanan) + tool use.
 //
 // Backend LLM: Gemini API (generativelanguage.googleapis.com), endpoint
 // `:generateContent`. Bentuk tool-nya beda dari Anthropic — `functionDeclarations`
@@ -6,6 +6,7 @@
 // mengirim hasil tool kembali.
 import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.58.0';
 import { toGalleryItem } from './_shared.ts';
+import { knowledgePrompt, retrieveKnowledge } from './knowledge.ts';
 
 const API_KEY = Deno.env.get('GEMINI_API_KEY') ?? '';
 const MODEL = Deno.env.get('CONSULT_MODEL') ?? 'gemini-3.5-flash';
@@ -46,13 +47,14 @@ const SYSTEM = `Kamu "Asisten Srikandi", asisten toko emas & perhiasan Srikandi 
 
 Aturan:
 - Jawab dalam Bahasa Indonesia yang ramah, ringkas (maksimal 4 kalimat), tanpa emoji berlebihan.
-- Jawab HANYA dari data yang kamu peroleh lewat tool atau yang tertulis di sini. Jangan mengarang harga, estimasi waktu, kadar, atau ketersediaan.
+- Jawab HANYA dari data yang kamu peroleh lewat tool, dari bagian "Dasar pengetahuan toko", atau yang tertulis di sini. Jangan mengarang harga, estimasi waktu, kadar, atau ketersediaan.
 - Harga & lama pengerjaan layanan bersifat penawaran; selalu katakan dikonfirmasi staf setelah barang dilihat langsung.
 - Untuk status pesanan, WAJIB pakai tool cekStatusPesanan. Jangan menebak.
 - Status pesanan hanya untuk pengguna yang sudah masuk. Kalau belum masuk, minta pengguna masuk lewat portal pesanan di situs, atau tawarkan bantuan lewat WhatsApp.
 - JANGAN PERNAH meminta nomor HP, kode akses, atau kata sandi di chat ini. Proses masuk hanya lewat halaman portal pesanan.
 - Jangan pernah menyatakan sebuah nomor pesanan "ada" atau "tidak ditemukan". Bila pesanan bukan milik pengguna yang sedang masuk, cukup katakan nomor itu tidak ada pada akunnya.
 - Jangan pernah meminta atau menampilkan data pribadi (NIK, nomor kartu, alamat lengkap) di chat.
+- Jangan pernah memberikan nomor rekening. Pembayaran dan rekening hanya dikonfirmasi admin lewat WhatsApp resmi.
 - Kalau pertanyaannya di luar cakupan toko, komplain, atau butuh tindakan admin (ubah/batalkan pesanan, refund), panggil tool hubungiAdmin.
 
 Alamat toko: Jl. Sumatra, Pahandut, Kota Palangka Raya. Buka Senin–Sabtu 09.00–16.00, Minggu 10.00–16.00.`;
@@ -232,6 +234,25 @@ export async function consult(
   let escalate: ReturnType<typeof buildEscalation> | undefined;
   let reply = '';
 
+  // RAG: ambil dokumen dasar pengetahuan yang paling mirip. Dua pesan pengguna
+  // terakhir digabung supaya balasan pendek ("yang putih ada?") tetap punya konteks.
+  const recentUser = history
+    .filter((m) => m.role === 'user')
+    .slice(-2)
+    .map((m) => m.content)
+    .join('\n');
+  const knowledge = await retrieveKnowledge(db, recentUser);
+  for (const d of knowledge) {
+    sources.push({ title: d.title, snippet: `kemiripan ${d.similarity.toFixed(2)}` });
+  }
+  const systemText = [
+    SYSTEM,
+    session ? `Pengguna sudah login sebagai ${session.name}.` : '',
+    knowledgePrompt(knowledge),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
   for (let round = 0; round < 3; round++) {
     const res = await fetch(endpoint(MODEL), {
       method: 'POST',
@@ -242,7 +263,7 @@ export async function consult(
       body: JSON.stringify({
         contents,
         systemInstruction: {
-          parts: [{ text: session ? `${SYSTEM}\n\nPengguna sudah login sebagai ${session.name}.` : SYSTEM }],
+          parts: [{ text: systemText }],
         },
         tools: TOOLS,
         generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS, temperature: 0.4 },
