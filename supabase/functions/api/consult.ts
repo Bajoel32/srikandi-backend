@@ -22,6 +22,61 @@ const MAX_OUTPUT_TOKENS = 2048;
 
 export const hasLLM = () => Boolean(API_KEY);
 
+// Ketahanan saat Gemini sibuk (503 "high demand", 429 kuota, 5xx lain, timeout):
+// coba ulang dengan jeda, lalu (opsional) pindah ke model cadangan. Kalau semua
+// gagal, konsumen mendapat pesan jujur + tombol WhatsApp, bukan error 500 yang
+// membuat frontend menampilkan jawaban statis yang tidak nyambung.
+const FALLBACK_MODEL = Deno.env.get('CONSULT_FALLBACK_MODEL') ?? '';
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+const RETRY_DELAYS_MS = [800, 2000];
+const LLM_CALL_TIMEOUT_MS = 20_000;
+const LLM_BUDGET_MS = 30_000; // batas total per panggilan, termasuk semua percobaan
+const BUSY_REPLY =
+  'Maaf, asisten kami sedang sibuk melayani banyak pertanyaan. ' +
+  'Silakan coba lagi sebentar lagi, atau langsung hubungi admin kami lewat WhatsApp.';
+
+class LLMUnavailableError extends Error {}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// deno-lint-ignore no-explicit-any
+async function callGemini(body: string): Promise<any> {
+  const models = FALLBACK_MODEL && FALLBACK_MODEL !== MODEL ? [MODEL, FALLBACK_MODEL] : [MODEL];
+  const deadline = Date.now() + LLM_BUDGET_MS;
+  let lastError = 'tidak ada percobaan';
+
+  for (const model of models) {
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+      if (attempt > 0) await sleep(RETRY_DELAYS_MS[attempt - 1]);
+      const remaining = deadline - Date.now();
+      if (remaining < 1000) throw new LLMUnavailableError(`batas waktu habis; terakhir: ${lastError}`);
+
+      let res: Response;
+      try {
+        res = await fetch(endpoint(model), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-goog-api-key': API_KEY },
+          body,
+          signal: AbortSignal.timeout(Math.min(LLM_CALL_TIMEOUT_MS, remaining)),
+        });
+      } catch (err) {
+        // Jaringan putus atau timeout: layak dicoba ulang.
+        lastError = `${model}: ${err instanceof Error ? err.message : String(err)}`;
+        console.warn(`[consult] ${lastError} (percobaan ${attempt + 1})`);
+        continue;
+      }
+
+      if (res.ok) return await res.json();
+
+      lastError = `${model} HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`;
+      console.warn(`[consult] ${lastError} (percobaan ${attempt + 1})`);
+      // 400/401/403/404 tidak akan membaik dengan dicoba ulang; langsung ke model berikutnya.
+      if (!RETRYABLE_STATUS.has(res.status)) break;
+    }
+  }
+  throw new LLMUnavailableError(lastError);
+}
+
 const SERVICES = [
   { id: 1, name: 'Cuci Emas', icon: '✨', description: 'Pembersihan emas hingga bersih dan berkilau seperti baru' },
   { id: 2, name: 'Pasang Berlian', icon: '💎', description: 'Pemasangan berlian dan batu mulia dengan presisi tinggi' },
@@ -233,6 +288,7 @@ export async function consult(
   const sources: Array<{ title: string; snippet?: string }> = [];
   let escalate: ReturnType<typeof buildEscalation> | undefined;
   let reply = '';
+  let llmDown = false;
 
   // RAG: ambil dokumen dasar pengetahuan yang paling mirip. Dua pesan pengguna
   // terakhir digabung supaya balasan pendek ("yang putih ada?") tetap punya konteks.
@@ -254,24 +310,25 @@ export async function consult(
     .join('\n\n');
 
   for (let round = 0; round < 3; round++) {
-    const res = await fetch(endpoint(MODEL), {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-goog-api-key': API_KEY,
-      },
-      body: JSON.stringify({
-        contents,
-        systemInstruction: {
-          parts: [{ text: systemText }],
-        },
-        tools: TOOLS,
-        generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS, temperature: 0.4 },
-      }),
-    });
-
-    if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
-    const data = await res.json();
+    // deno-lint-ignore no-explicit-any
+    let data: any;
+    try {
+      data = await callGemini(
+        JSON.stringify({
+          contents,
+          systemInstruction: {
+            parts: [{ text: systemText }],
+          },
+          tools: TOOLS,
+          generationConfig: { maxOutputTokens: MAX_OUTPUT_TOKENS, temperature: 0.4 },
+        }),
+      );
+    } catch (err) {
+      if (!(err instanceof LLMUnavailableError)) throw err;
+      console.error('[consult] LLM tidak tersedia:', err.message);
+      llmDown = true;
+      break;
+    }
 
     const candidate = data.candidates?.[0];
     const parts: Part[] = candidate?.content?.parts ?? [];
@@ -303,6 +360,11 @@ export async function consult(
       responses.push({ functionResponse: { name: call.name, response: { result } } });
     }
     contents.push({ role: 'user', parts: responses });
+  }
+
+  if (llmDown && !reply) {
+    reply = BUSY_REPLY;
+    escalate ??= buildEscalation('Asisten AI sedang sibuk', lastUser.slice(0, 200));
   }
 
   return {
